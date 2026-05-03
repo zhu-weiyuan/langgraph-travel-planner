@@ -12,6 +12,10 @@ class TravelPlanState(TypedDict):
     # 对话消息历史
     messages: Annotated[List, add_messages]
 
+    # ---- 意图分类 ----
+    intent: Optional[str]              # 'chat' 或 'plan'
+    user_message: Optional[str]        # 原始用户消息（用于闲聊回复）
+
     # ---- 用户请求解析结果 ----
     destination: Optional[str]          # 目的地（用户指定或推荐）
     destination_country: Optional[str]  # 国家/地区

@@ -12,9 +12,28 @@
 
 from typing import Dict, Any, List
 from langchain_core.messages import HumanMessage, AIMessage
+import sys
+import io
 import urllib.request
 import json
 import re
+import logging
+
+# Windows console UTF-8 fix (only if not already redirected)
+if sys.platform == 'win32' and not isinstance(sys.stdout, io.TextIOWrapper):
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    except (OSError, ValueError):
+        pass  # LangGraph may have already closed/redirected stdout
+
+# Safe print that works even when stdout is closed
+def _safe_print(msg):
+    """Print safely in multi-threaded LangGraph context."""
+    try:
+        print(msg)
+    except (ValueError, OSError):
+        logging.warning(msg)
 
 LLM_API_URL = "http://127.0.0.1:8080/v1/chat/completions"
 LLM_API_KEY = "your_key_here"
@@ -96,7 +115,126 @@ def _call_llm_json(messages: List[dict], system: str, max_tokens: int = 256) -> 
 
 
 # ============================================================
-# 节点1: 解析用户请求
+# 节点0: 意图分类（闲聊 vs 旅行规划）
+# ============================================================
+
+INTENT_SYSTEM = """你是一个意图分类器。判断用户的消息是否包含旅行规划相关的需求。
+
+返回严格的 JSON：
+{
+    "intent": "chat" 或 "plan",
+    "reason": "简短原因"
+}
+
+规则：
+- "chat"：问候（你好/hi/hello）、闲聊、感谢、道别、无意义输入
+- "plan"：包含目的地、天数、预算、行程、推荐、旅游等关键词，或明确表达旅行意愿
+- 如果用户说"帮我规划"、"我想去"、"推荐"、"多少钱"、"几天"→ plan
+- 如果用户只说"你好"、"在吗"、"谢谢"、"再见"→ chat
+- 不确定时偏向 plan（让用户得到帮助）
+
+不要添加额外文字，只返回 JSON。"""
+
+
+def classify_intent(state: Dict[str, Any]) -> Dict[str, Any]:
+    """意图分类节点：区分闲聊和旅行规划请求。"""
+    messages = state.get('messages', [])
+    user_message = ''
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            user_message = msg.content
+            break
+
+    if not user_message:
+        return {'intent': 'chat'}
+
+    # Fast path: common greeting patterns (no LLM needed)
+    greetings = ['你好', '您好', '嗨', 'hi', 'hello', '在吗', '在不在',
+                 '早上好', '晚上好', '中午好', '下午好', '嘿', 'hey',
+                 '谢谢', '感谢', '再见', '拜拜', 'bye', '好的', '嗯',
+                 '哦', '哈哈', '嘻嘻', '嗯嗯', 'ok', 'ok的']
+    clean_msg = user_message.strip().rstrip('！？!?.。').strip()
+    if clean_msg in greetings or len(clean_msg) <= 2:
+        _safe_print(f"[意图分类] chat（快速匹配）: '{user_message}'")
+        return {'intent': 'chat'}
+
+    # LLM classification for ambiguous cases
+    result = _call_llm_json(
+        [{"role": "user", "content": f"用户消息：{user_message}"}],
+        INTENT_SYSTEM,
+        max_tokens=64
+    )
+
+    intent = result.get('intent', 'plan')  # default to plan if unclear
+    _safe_print(f"[意图分类] {intent}: '{user_message[:50]}'")
+    return {'intent': intent, 'user_message': user_message}
+
+
+# ============================================================
+# 节点1: 闲聊回复
+# ============================================================
+
+CHAT_SYSTEM = """你是一个友好的旅游规划助手。用户跟你打招呼或闲聊，请用简短、亲切的方式回应。
+
+规则：
+- 简短回复，1-2句话即可
+- 主动引导用户说出旅行需求
+- 可以提几个例子激发灵感
+- 语气轻松自然，不要太正式"""
+
+
+def chat_reply(state: Dict[str, Any]) -> Dict[str, Any]:
+    """闲聊回复节点：简短回应 + 引导。"""
+    messages = state.get('messages', [])
+    user_message = ''
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            user_message = msg.content
+            break
+
+    # Common greeting responses (fast path)
+    greeting_responses = {
+        '你好': ['你好呀！👋 想去哪里玩？告诉我目的地和天数，我来帮你规划行程～',
+                 '嗨！我是你的旅游规划助手 🌍 说说你想去哪？'],
+        '您好': ['您好！😊 有什么旅行计划吗？我可以帮您做详细的行程规划。',
+                 '您好呀！想去哪里玩？告诉我目的地和预算就好啦～'],
+        'hi': ['Hi there! 👋 Ready to plan your next trip? Tell me where you want to go!',
+               'Hey! I can help you plan a trip. Where are you thinking of going?'],
+        'hello': ['Hello! 🌍 Looking for travel inspiration? Just tell me your destination!',
+                  'Hi! What trip can I help you plan today?'],
+        '在吗': ['在的！有什么旅行计划需要帮忙的吗？🗺️',
+                 '在呢～想去哪里玩？告诉我目的地和天数就好！'],
+        '谢谢': ['不客气！😊 还有其他问题随时问我～',
+                 '应该的！祝你旅途愉快 🎉'],
+        '再见': ['再见！旅途愉快～ 🌟',
+                 '拜拜！下次旅行还找我规划 😄'],
+    }
+
+    clean_msg = user_message.strip().rstrip('！？!?.。').strip()
+
+    # Check exact or partial match
+    for key, responses in greeting_responses.items():
+        if key in clean_msg or clean_msg in key:
+            import random
+            reply = random.choice(responses)
+            ai_message = AIMessage(content=reply)
+            _safe_print(f"[闲聊回复] '{user_message}' → '{reply[:30]}...'")
+            return {'messages': [ai_message], 'final_output': reply}
+
+    # LLM-generated chat reply for other casual messages
+    reply = _call_llm(
+        [{"role": "user", "content": user_message}],
+        CHAT_SYSTEM,
+        max_tokens=128,
+        temperature=0.8
+    )
+    ai_message = AIMessage(content=reply)
+    _safe_print(f"[闲聊回复] LLM: '{user_message[:30]}'")
+    return {'messages': [ai_message], 'final_output': reply}
+
+
+# ============================================================
+# 节点2: 解析用户请求
 # ============================================================
 
 PARSE_SYSTEM = """你是一个旅游需求分析专家。从用户输入中提取关键信息，返回严格的 JSON 格式：
@@ -214,7 +352,7 @@ def parse_request(state: Dict[str, Any]) -> Dict[str, Any]:
 
     # Fallback: if LLM didn't return useful JSON, use regex parsing
     if not result.get('destination') and re.search(r'[\u4e00-\u9fff]{2,6}', user_message):
-        print(f"[需求解析] LLM JSON 返回空，使用正则 fallback")
+        _safe_print(f"[需求解析] LLM JSON 返回空，使用正则 fallback")
         result = _fallback_parse(user_message)
 
     # Ensure days is at least what user asked for
@@ -229,7 +367,7 @@ def parse_request(state: Dict[str, Any]) -> Dict[str, Any]:
         val = budget_check.group(1).replace('千', '000')
         result['budget'] = float(val)
 
-    print(f"[需求解析] 目的地={result.get('destination')}, 天数={result.get('days')}, "
+    _safe_print(f"[需求解析] 目的地={result.get('destination')}, 天数={result.get('days')}, "
           f"预算={result.get('budget')}, 风格={result.get('travel_style')}")
 
     return {
@@ -321,7 +459,7 @@ def research_destinations(state: Dict[str, Any]) -> Dict[str, Any]:
                 if name:
                     attractions.append(name)
 
-    print(f"[目的地研究] {destination} — 已生成详细规划信息")
+    _safe_print(f"[目的地研究] {destination} — 已生成详细规划信息")
     return {'destination_info': info, 'attractions': attractions[:8], 'restaurants': restaurants[:6], 'tips': tips[:5]}
 
 
@@ -458,7 +596,7 @@ def plan_itinerary(state: Dict[str, Any]) -> Dict[str, Any]:
         max_tokens=1024
     )
 
-    print(f"[行程规划] {destination} {days}天 — 已生成详细行程")
+    _safe_print(f"[行程规划] {destination} {days}天 — 已生成详细行程")
     return {'itinerary': itinerary}
 
 
@@ -512,7 +650,7 @@ def estimate_budget(state: Dict[str, Any]) -> Dict[str, Any]:
         max_tokens=512
     )
 
-    print(f"[预算估算] {destination} — 已生成费用明细")
+    _safe_print(f"[预算估算] {destination} — 已生成费用明细")
     return {'budget_breakdown': breakdown}
 
 
@@ -549,7 +687,7 @@ def format_output(state: Dict[str, Any]) -> Dict[str, Any]:
     final = '\n'.join(output_parts)
     ai_message = AIMessage(content=final)
 
-    print(f"[最终输出] {destination} {days}天行程 — 完成 ({len(final)} chars)")
+    _safe_print(f"[最终输出] {destination} {days}天行程 — 完成 ({len(final)} chars)")
     return {'messages': [ai_message], 'final_output': final}
 
 
@@ -581,5 +719,5 @@ def refine_plan(state: Dict[str, Any]) -> Dict[str, Any]:
         max_tokens=1024
     )
 
-    print(f"[行程优化] 第 {state.get('refinement_round', 1)} 轮 — 已根据反馈调整")
+    _safe_print(f"[行程优化] 第 {state.get('refinement_round', 1)} 轮 — 已根据反馈调整")
     return {'itinerary': refined, 'refinement_round': state.get('refinement_round', 0) + 1}

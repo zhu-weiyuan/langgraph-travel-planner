@@ -13,6 +13,8 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from .state import TravelPlanState
 from .nodes import (
+    classify_intent,
+    chat_reply,
     parse_request,
     research_destinations,
     check_weather,
@@ -21,6 +23,14 @@ from .nodes import (
     format_output,
     refine_plan,
 )
+
+
+def route_by_intent(state: dict) -> str:
+    """根据意图分类路由到闲聊或规划流程。"""
+    intent = state.get('intent', 'plan')
+    if intent == 'chat':
+        return 'chat_reply'
+    return 'parse_request'
 
 
 def should_refine(state: dict) -> str:
@@ -34,10 +44,17 @@ def should_refine(state: dict) -> str:
 
 
 def _build_core_graph():
-    """构建 StateGraph 拓扑。"""
+    """构建 StateGraph 拓扑。
+
+    流程：
+    classify_intent → [chat: chat_reply → END]
+                     → [plan: parse_request → research + weather → itinerary → budget → output]
+    """
     graph = StateGraph(TravelPlanState)
 
     # Nodes
+    graph.add_node('classify_intent', classify_intent)
+    graph.add_node('chat_reply', chat_reply)
     graph.add_node('parse_request', parse_request)
     graph.add_node('research_destinations', research_destinations)
     graph.add_node('check_weather', check_weather)
@@ -46,10 +63,20 @@ def _build_core_graph():
     graph.add_node('format_output', format_output)
     graph.add_node('refine_plan', refine_plan)
 
-    # Entry: parse user request
-    graph.add_edge(START, 'parse_request')
+    # Entry: classify intent first
+    graph.add_edge(START, 'classify_intent')
 
-    # Research phase (parallel research + weather)
+    # Route by intent
+    graph.add_conditional_edges(
+        'classify_intent',
+        route_by_intent,
+        {'chat_reply': 'chat_reply', 'parse_request': 'parse_request'}
+    )
+
+    # Chat reply → END (short circuit)
+    graph.add_edge('chat_reply', END)
+
+    # Planning flow
     graph.add_edge('parse_request', 'research_destinations')
     graph.add_edge('parse_request', 'check_weather')
 
