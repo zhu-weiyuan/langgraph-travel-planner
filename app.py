@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Web server for LangGraph Travel Planner Agent.
+Web server for LangGraph Travel Planner Agent — with SSE streaming.
 
 Run: python app.py
 Visit: http://localhost:7861
@@ -9,8 +9,10 @@ Visit: http://localhost:7861
 import sys
 import io
 import json
+import re
 from uuid import uuid4
 from datetime import datetime
+from threading import Thread
 
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -32,8 +34,39 @@ def init():
     print(f"[Server] Travel Planner Agent initialized (sqlite={use_sqlite})")
 
 
-def run_planner(session_id, user_message):
-    """Run the travel planner for a user message."""
+def strip_markdown(text: str) -> str:
+    """Convert Markdown formatting to clean text / HTML-friendly output."""
+    if not text:
+        return ''
+    # Remove bold **text** → text
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    # Remove italic *text* → text (remaining single asterisks)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    # Remove headers # ## ### → prefix with emoji for visual hierarchy
+    text = re.sub(r'^### (.+)$', r'🔹 \1', text, flags=re.MULTILINE)
+    text = re.sub(r'^## (.+)$', r'📌 \1', text, flags=re.MULTILINE)
+    text = re.sub(r'^# (.+)$', r'🏷️ \1', text, flags=re.MULTILINE)
+    # Remove horizontal rules --- → separator line
+    text = re.sub(r'^---+$', '━━━━━━━━━━━━━━', text, flags=re.MULTILINE)
+    # Remove remaining standalone asterisks used as bullet points
+    text = re.sub(r'^\*\s+', '• ', text, flags=re.MULTILINE)
+    # Clean up any leftover markdown table pipes (simple approach)
+    lines = text.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        # If line looks like a markdown table row with | separators
+        if '|' in line and line.strip().startswith('|'):
+            cells = [c.strip() for c in line.split('|')[1:-1]]
+            if all(c == '-' or c == ':' for c in cells):
+                continue  # skip separator rows
+            cleaned_lines.append('  '.join(cells))
+        else:
+            cleaned_lines.append(line)
+    return '\n'.join(cleaned_lines)
+
+
+def run_planner_stream(session_id, user_message, callback):
+    """Run the travel planner and stream partial results via callback."""
     config = {"configurable": {"thread_id": session_id}}
     human_msg = HumanMessage(content=user_message)
 
@@ -43,8 +76,6 @@ def run_planner(session_id, user_message):
     user_feedback = None
 
     if current_state and current_state.values:
-        existing_msgs = current_state.values.get('messages', [])
-        # If there's already a final_output, treat new message as feedback
         if current_state.values.get('final_output'):
             user_feedback = user_message
             refinement_round = current_state.values.get('refinement_round', 0)
@@ -59,23 +90,36 @@ def run_planner(session_id, user_message):
 
     try:
         for event in _graph.stream(input_data, config=config, stream_mode="values"):
-            pass  # Run through all nodes
+            # Stream intermediate info to callback
+            partial_output = event.get('final_output', '')
+            if partial_output:
+                clean = strip_markdown(partial_output)
+                callback(clean, meta={
+                    'destination': event.get('destination', ''),
+                    'days': event.get('days', 0),
+                    'budget': event.get('budget'),
+                    'travel_style': event.get('travel_style', ''),
+                    'refinement_round': event.get('refinement_round', 0),
+                })
+
+        state = _graph.get_state(config)
+        if state and state.values:
+            final = state.values.get('final_output', '')
+            clean_final = strip_markdown(final)
+            callback(clean_final, meta={
+                'destination': state.values.get('destination', ''),
+                'days': state.values.get('days', 0),
+                'budget': state.values.get('budget'),
+                'travel_style': state.values.get('travel_style', ''),
+                'refinement_round': state.values.get('refinement_round', 0),
+            }, done=True)
+        else:
+            callback('规划生成中，请稍候...', done=True)
     except Exception as e:
         print(f"[Agent Error] {e}")
         import traceback
         traceback.print_exc()
-
-    state = _graph.get_state(config)
-    if state and state.values:
-        return {
-            'output': state.values.get('final_output', '规划生成中，请稍候...'),
-            'destination': state.values.get('destination', ''),
-            'days': state.values.get('days', 0),
-            'budget': state.values.get('budget'),
-            'travel_style': state.values.get('travel_style', ''),
-            'refinement_round': state.values.get('refinement_round', 0),
-        }
-    return {'output': '抱歉，规划生成失败，请重试。'}
+        callback(f'❌ 错误: {str(e)}', done=True, error=True)
 
 
 # ============================================================
@@ -91,7 +135,7 @@ CHAT_HTML = r"""<!DOCTYPE html>
 <style>
   :root {
     --primary: #0ea5e9;
-    --primary-dark: #0284c7;
+    --primary-dark: #2563eb;
     --accent: #f59e0b;
     --bg: #f0f9ff;
     --surface: #ffffff;
@@ -113,7 +157,6 @@ CHAT_HTML = r"""<!DOCTYPE html>
     flex-direction: column;
   }
 
-  /* Header */
   .header {
     background: linear-gradient(135deg, #0ea5e9 0%, #2563eb 50%, #7c3aed 100%);
     color: white;
@@ -139,10 +182,8 @@ CHAT_HTML = r"""<!DOCTYPE html>
   }
   .header-btn:hover { background: rgba(255,255,255,0.25); }
 
-  /* Main layout */
   .main { flex: 1; display: flex; overflow: hidden; }
 
-  /* Sidebar */
   .sidebar {
     width: 300px;
     background: var(--surface);
@@ -167,7 +208,6 @@ CHAT_HTML = r"""<!DOCTYPE html>
   .quick-card:hover { border-color: var(--primary); background: #e0f2fe; transform: translateY(-1px); box-shadow: var(--shadow); }
   .quick-card .emoji { font-size: 18px; margin-right: 8px; }
 
-  /* Chat area */
   .chat-area { flex: 1; display: flex; flex-direction: column; }
 
   .chat-container {
@@ -197,7 +237,7 @@ CHAT_HTML = r"""<!DOCTYPE html>
     padding: 16px 20px;
     border-radius: var(--radius);
     font-size: 14px;
-    line-height: 1.7;
+    line-height: 1.8;
     white-space: pre-wrap;
     word-break: break-word;
   }
@@ -212,6 +252,14 @@ CHAT_HTML = r"""<!DOCTYPE html>
     border-bottom-left-radius: 4px;
   }
 
+  /* Streaming cursor */
+  .streaming-cursor::after {
+    content: '▊';
+    animation: blink 0.8s infinite;
+    color: var(--primary);
+  }
+  @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
+
   .system-msg {
     align-self: center;
     padding: 8px 20px;
@@ -221,14 +269,12 @@ CHAT_HTML = r"""<!DOCTYPE html>
     color: #64748b;
   }
 
-  /* Typing indicator */
   .typing-indicator { display: flex; gap: 5px; padding: 12px 16px; align-items: center; }
   .typing-indicator .dot { width: 8px; height: 8px; background: #94a3b8; border-radius: 50%; animation: bounce 1.4s infinite; }
   .typing-indicator .dot:nth-child(2) { animation-delay: 0.2s; }
   .typing-indicator .dot:nth-child(3) { animation-delay: 0.4s; }
   @keyframes bounce { 0%, 60%, 100% { transform: translateY(0); } 30% { transform: translateY(-8px); } }
 
-  /* Input area */
   .input-area {
     padding: 20px 32px;
     background: var(--surface);
@@ -266,7 +312,6 @@ CHAT_HTML = r"""<!DOCTYPE html>
   .send-btn:hover { transform: translateY(-1px); box-shadow: 0 4px 16px rgba(14,165,233,0.3); }
   .send-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
 
-  /* Info bar */
   .info-bar {
     padding: 8px 32px;
     background: #f8fafc;
@@ -278,15 +323,9 @@ CHAT_HTML = r"""<!DOCTYPE html>
   }
   .info-bar span { display: flex; align-items: center; gap: 4px; }
 
-  /* Markdown-like rendering in bot bubbles */
-  .bubble h2 { font-size: 16px; margin: 12px 0 8px; color: #0f172a; }
-  .bubble h3 { font-size: 14px; margin: 10px 0 6px; color: #1e40af; }
-
-  /* Scrollbar */
   .chat-container::-webkit-scrollbar { width: 6px; }
   .chat-container::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
 
-  /* Mobile */
   @media (max-width: 768px) {
     .sidebar { display: none; }
     .header { padding: 16px; }
@@ -295,7 +334,6 @@ CHAT_HTML = r"""<!DOCTYPE html>
     .message { max-width: 95%; }
   }
 
-  /* Welcome screen */
   .welcome { text-align: center; padding: 60px 32px; color: var(--text-secondary); }
   .welcome h2 { font-size: 28px; color: var(--text); margin-bottom: 12px; }
   .welcome p { font-size: 15px; line-height: 1.6; max-width: 500px; margin: 0 auto 24px; }
@@ -317,7 +355,7 @@ CHAT_HTML = r"""<!DOCTYPE html>
 <div class="header">
   <div>
     <h1>🌍 智能旅游规划助手</h1>
-    <div class="header-subtitle">基于 LangGraph + Qwen3.6-27B · 本地运行</div>
+    <div class="header-subtitle">基于 LangGraph + Qwen3.6-27B · 本地运行 · 流式输出</div>
   </div>
   <div class="header-actions">
     <button class="header-btn" onclick="newSession()">✨ 新规划</button>
@@ -372,11 +410,11 @@ CHAT_HTML = r"""<!DOCTYPE html>
           </div>
           <div class="welcome-feature">
             <div class="icon">🌤️</div>
-            <strong>天气查询</strong><br>实时天气预报
+            <strong>天气查询</strong><br>实时天气预报（彩云）
           </div>
           <div class="welcome-feature">
-            <div class="icon">🔄</div>
-            <strong>迭代优化</strong><br>根据你的反馈调整
+            <div class="icon">⚡</div>
+            <strong>流式输出</strong><br>逐字显示，无需等待
           </div>
         </div>
       </div>
@@ -404,7 +442,6 @@ const chatContainer = document.getElementById('chatContainer');
 const messageInput = document.getElementById('messageInput');
 const sendBtn = document.getElementById('sendBtn');
 
-// Auto-resize textarea
 function autoResize(el) {
   el.style.height = 'auto';
   el.style.height = Math.min(el.scrollHeight, 120) + 'px';
@@ -418,7 +455,6 @@ messageInput.addEventListener('keydown', (e) => {
 });
 
 function addMessage(role, content) {
-  // Hide welcome screen
   const welcome = document.getElementById('welcomeScreen');
   if (welcome) welcome.remove();
 
@@ -437,6 +473,7 @@ function addMessage(role, content) {
   div.appendChild(bubble);
   chatContainer.appendChild(div);
   chatContainer.scrollTop = chatContainer.scrollHeight;
+  return bubble;
 }
 
 function addTyping() {
@@ -460,6 +497,17 @@ function removeTyping() {
   if (el) el.remove();
 }
 
+function updateInfo(meta) {
+  if (!meta) return;
+  if (meta.destination) document.getElementById('infoDest').textContent = meta.destination;
+  if (meta.days) document.getElementById('infoDays').textContent = meta.days + '天';
+  if (meta.budget) document.getElementById('infoBudget').textContent = '¥' + meta.budget;
+  if (meta.travel_style) {
+    const styleMap = { budget:'经济', comfortable:'舒适', luxury:'奢华', adventure:'探险', cultural:'文化', beach:'海滨' };
+    document.getElementById('infoStyle').textContent = styleMap[meta.travel_style] || meta.travel_style;
+  }
+}
+
 async function sendMessage() {
   if (isProcessing) return;
   const message = messageInput.value.trim();
@@ -477,27 +525,55 @@ async function sendMessage() {
     const session = currentSession || crypto.randomUUID();
     if (!currentSession) currentSession = session;
 
-    const response = await fetch('/api/plan', {
+    // Create bot bubble for streaming content
+    removeTyping();
+    const bubble = addMessage('bot', '');
+    bubble.classList.add('streaming-cursor');
+
+    // Stream via SSE
+    const response = await fetch('/api/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message, session_id: session })
     });
 
-    removeTyping();
-    const data = await response.json();
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let fullText = '';
+    let meta = {};
+    let buffer = '';
 
-    if (data.error) {
-      addMessage('bot', '❌ 错误: ' + data.error);
-    } else {
-      addMessage('bot', data.output);
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
 
-      // Update info bar
-      if (data.destination) document.getElementById('infoDest').textContent = data.destination;
-      if (data.days) document.getElementById('infoDays').textContent = data.days + '天';
-      if (data.budget) document.getElementById('infoBudget').textContent = '¥' + data.budget;
-      if (data.travel_style) {
-        const styleMap = { budget:'经济', comfortable:'舒适', luxury:'奢华', adventure:'探险', cultural:'文化', beach:'海滨' };
-        document.getElementById('infoStyle').textContent = styleMap[data.travel_style] || data.travel_style;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const dataStr = line.slice(6);
+        try {
+          const data = JSON.parse(dataStr);
+          if (data.content !== undefined) {
+            fullText = data.content;
+            bubble.textContent = fullText;
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+          }
+          if (data.meta) {
+            meta = data.meta;
+            updateInfo(meta);
+          }
+          if (data.done) {
+            bubble.classList.remove('streaming-cursor');
+            if (data.error) {
+              bubble.textContent = '❌ 错误: ' + (data.content || '请求失败');
+            }
+          }
+        } catch (e) {
+          // skip malformed JSON
+        }
       }
     }
   } catch (err) {
@@ -543,7 +619,44 @@ class ChatHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
-        if self.path == '/api/plan':
+        if self.path == '/api/stream':
+            # SSE streaming endpoint
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8'))
+
+            user_message = data.get('message', '')
+            session_id = data.get('session_id', str(uuid4()))
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.send_header('X-Accel-Buffering', 'no')
+            self.end_headers()
+
+            def sse_callback(content, meta=None, done=False, error=False):
+                payload = {'content': content}
+                if meta:
+                    payload['meta'] = meta
+                if done:
+                    payload['done'] = True
+                    if error:
+                        payload['error'] = True
+
+                line = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                try:
+                    self.wfile.write(line.encode('utf-8'))
+                    self.wfile.flush()
+                except (BrokenPipeError, OSError):
+                    pass  # client disconnected
+
+            # Run planner in background thread to stream results
+            t = Thread(target=run_planner_stream, args=(session_id, user_message, sse_callback), daemon=True)
+            t.start()
+
+        elif self.path == '/api/plan':
+            # Legacy non-streaming endpoint (kept for compatibility)
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length)
             data = json.loads(body.decode('utf-8'))
@@ -552,8 +665,16 @@ class ChatHandler(BaseHTTPRequestHandler):
             session_id = data.get('session_id', str(uuid4()))
 
             try:
-                result = run_planner(session_id, user_message)
-                response = json.dumps(result, ensure_ascii=False)
+                final_result = [None]
+                def collect_callback(content, meta=None, done=False, error=False):
+                    if done and not error:
+                        final_result[0] = {'output': content, **meta}
+                run_planner_stream(session_id, user_message, collect_callback)
+
+                if final_result[0]:
+                    response = json.dumps(final_result[0], ensure_ascii=False)
+                else:
+                    response = json.dumps({'error': '规划生成失败'}, ensure_ascii=False)
             except Exception as e:
                 import traceback
                 traceback.print_exc()

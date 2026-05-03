@@ -118,26 +118,30 @@ def _call_llm_json(messages: List[dict], system: str, max_tokens: int = 256) -> 
 # 节点0: 意图分类（闲聊 vs 旅行规划）
 # ============================================================
 
-INTENT_SYSTEM = """你是一个意图分类器。判断用户的消息是否包含旅行规划相关的需求。
+INTENT_SYSTEM = """你是一个意图分类器。判断用户的消息属于哪种类型。
 
 返回严格的 JSON：
 {
-    "intent": "chat" 或 "plan",
+    "intent": "chat" 或 "recommend" 或 "plan",
     "reason": "简短原因"
 }
 
-规则：
-- "chat"：问候（你好/hi/hello）、闲聊、感谢、道别、无意义输入
-- "plan"：包含目的地、天数、预算、行程、推荐、旅游等关键词，或明确表达旅行意愿
-- 如果用户说"帮我规划"、"我想去"、"推荐"、"多少钱"、"几天"→ plan
-- 如果用户只说"你好"、"在吗"、"谢谢"、"再见"→ chat
-- 不确定时偏向 plan（让用户得到帮助）
+三种意图：
+- "chat"：纯问候/闲聊/感谢/道别（你好、hi、在吗、谢谢、再见）
+- "recommend"：用户没有明确目的地，想要推荐（"去哪里好"、"推荐个地方"、"你觉得去哪"、"有什么好去处"）
+- "plan"：用户已指定目的地或给出具体旅行需求（"去云南"、"东京5天"、"帮我规划巴黎行程"）
+
+关键区分：
+- 有明确目的地 → plan
+- 没有目的地但要推荐 → recommend
+- 纯聊天 → chat
+- 不确定时偏向 recommend（不要默认假设目的地）
 
 不要添加额外文字，只返回 JSON。"""
 
 
 def classify_intent(state: Dict[str, Any]) -> Dict[str, Any]:
-    """意图分类节点：区分闲聊和旅行规划请求。"""
+    """意图分类节点：区分闲聊 / 推荐 / 规划。"""
     messages = state.get('messages', [])
     user_message = ''
     for msg in reversed(messages):
@@ -158,6 +162,24 @@ def classify_intent(state: Dict[str, Any]) -> Dict[str, Any]:
         _safe_print(f"[意图分类] chat（快速匹配）: '{user_message}'")
         return {'intent': 'chat'}
 
+    # Fast path: recommend patterns (no LLM needed)
+    recommend_keywords = ['去哪里', '去哪玩', '推荐', '好去处', '有什么推荐',
+                          '你觉得', '哪里好', '去哪个', '去什么', '求推荐',
+                          '想去但不知道', '没有目的地']
+    has_dest_indicator = any(kw in clean_msg for kw in ['去北京', '去上海', '去广州',
+        '去深圳', '去成都', '去杭州', '去西安', '去重庆', '去南京', '去武汉',
+        '去长沙', '去昆明', '去厦门', '去青岛', '去大连', '去三亚', '去丽江',
+        '去桂林', '去云南', '去贵州', '去四川', '去广西', '去海南', '去西藏',
+        '去新疆', '去甘肃', '去青海', '去东北', '去内蒙古', '去台湾',
+        '去东京', '去大阪', '去首尔', '去曼谷', '去新加坡', '去吉隆坡',
+        '去巴黎', '去伦敦', '去纽约', '去洛杉矶', '去悉尼', '去迪拜',
+        '去欧洲', '去日本', '去韩国', '去泰国', '去马尔代夫', '去毛里求斯'])
+    has_recom_keyword = any(kw in clean_msg for kw in recommend_keywords)
+
+    if has_recom_keyword and not has_dest_indicator:
+        _safe_print(f"[意图分类] recommend（快速匹配）: '{user_message}'")
+        return {'intent': 'recommend', 'user_message': user_message}
+
     # LLM classification for ambiguous cases
     result = _call_llm_json(
         [{"role": "user", "content": f"用户消息：{user_message}"}],
@@ -165,7 +187,7 @@ def classify_intent(state: Dict[str, Any]) -> Dict[str, Any]:
         max_tokens=64
     )
 
-    intent = result.get('intent', 'plan')  # default to plan if unclear
+    intent = result.get('intent', 'recommend')  # default to recommend if unclear
     _safe_print(f"[意图分类] {intent}: '{user_message[:50]}'")
     return {'intent': intent, 'user_message': user_message}
 
@@ -231,6 +253,93 @@ def chat_reply(state: Dict[str, Any]) -> Dict[str, Any]:
     ai_message = AIMessage(content=reply)
     _safe_print(f"[闲聊回复] LLM: '{user_message[:30]}'")
     return {'messages': [ai_message], 'final_output': reply}
+
+
+# ============================================================
+# 节点1b: 目的地推荐（当用户没有明确目的地时）
+# ============================================================
+
+RECOMMEND_SYSTEM = """你是一个旅游推荐专家。根据用户的需求和偏好，推荐3-5个适合的旅行目的地。
+
+对每个目的地提供：
+1. 目的地名称 + 一句话亮点
+2. 适合的季节/月份
+3. 大致预算范围（每人）
+4. 为什么推荐给用户（结合用户兴趣）
+
+最后让用户选择感兴趣的目的地，你会为他做详细规划。
+
+语气轻松友好，像朋友给建议一样。不要直接生成完整行程——先推荐，等用户选了再做规划。"""
+
+
+def recommend_destinations(state: Dict[str, Any]) -> Dict[str, Any]:
+    """目的地推荐节点：当用户没有明确目的地时，推荐几个选择。"""
+    user_message = state.get('user_message', '')
+    messages = state.get('messages', [])
+
+    # Try to extract any preferences from the message
+    interests = []
+    season = None
+    budget_hint = None
+
+    msg_lower = user_message.lower()
+    if any(w in msg_lower for w in ['美食', '吃', '吃货']):
+        interests.append('美食')
+    if any(w in msg_lower for w in ['海边', '海滩', '海岛', '潜水']):
+        interests.append('海滨')
+    if any(w in msg_lower for w in ['历史', '文化', '古迹', '博物馆']):
+        interests.append('文化')
+    if any(w in msg_lower for w in ['自然', '山水', '风景', '户外']):
+        interests.append('自然')
+    if any(w in msg_lower for w in ['购物', '逛街']):
+        interests.append('购物')
+    if any(w in msg_lower for w in ['亲子', '孩子', '带娃', '家庭']):
+        interests.append('亲子')
+    if any(w in msg_lower for w in ['穷游', '省钱', '经济', '便宜']):
+        budget_hint = '经济实惠'
+    elif any(w in msg_lower for w in ['奢华', '高端', '豪华', '贵']):
+        budget_hint = '高端奢华'
+
+    # Detect season from message
+    import datetime
+    now = datetime.datetime.now()
+    current_season = ''
+    month = now.month
+    if month in [3, 4, 5]:
+        current_season = '春季（3-5月）'
+    elif month in [6, 7, 8]:
+        current_season = '夏季（6-8月）'
+    elif month in [9, 10, 11]:
+        current_season = '秋季（9-11月）'
+    else:
+        current_season = '冬季（12-2月）'
+
+    # Check if user mentioned a specific time
+    season_keywords = {'春天': '春季', '夏天': '夏季', '秋天': '秋季', '冬天': '冬季',
+                       '寒假': '冬季', '暑假': '夏季', '五一': '春季', '国庆': '秋季'}
+    for kw, s in season_keywords.items():
+        if kw in user_message:
+            current_season = s
+            break
+
+    interest_str = '、'.join(interests) if interests else '无特定偏好'
+    budget_str = f'，预算偏好：{budget_hint}' if budget_hint else ''
+
+    prompt = (f"用户说：\"{user_message}\"\n"
+              f"- 当前季节：{current_season}\n"
+              f"- 兴趣偏好：{interest_str}{budget_str}\n\n"
+              f"请推荐3-5个适合他的旅行目的地。")
+
+    recommendation = _call_llm(
+        [{"role": "user", "content": prompt}],
+        RECOMMEND_SYSTEM,
+        max_tokens=768,
+        temperature=0.9
+    )
+
+    ai_message = AIMessage(content=recommendation)
+    _safe_print(f"[目的地推荐] 已生成推荐（兴趣={interest_str}，季节={current_season}）")
+    return {'messages': [ai_message], 'final_output': recommendation}
 
 
 # ============================================================
@@ -666,10 +775,11 @@ def format_output(state: Dict[str, Any]) -> Dict[str, Any]:
     itinerary = state.get('itinerary', '')
     budget = state.get('budget_breakdown', '')
 
-    # Combine all sections
+    # Combine all sections — only include non-empty, meaningful content
     output_parts = []
 
-    if weather:
+    # Weather: only show if it has real data (not fallback messages)
+    if weather and '暂无目的地' not in weather and '无法获取' not in weather:
         output_parts.append(weather)
         output_parts.append("")
 

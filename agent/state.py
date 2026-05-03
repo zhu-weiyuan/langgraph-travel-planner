@@ -13,8 +13,8 @@ class TravelPlanState(TypedDict):
     messages: Annotated[List, add_messages]
 
     # ---- 意图分类 ----
-    intent: Optional[str]              # 'chat' 或 'plan'
-    user_message: Optional[str]        # 原始用户消息（用于闲聊回复）
+    intent: Optional[str]              # 'chat' / 'recommend' / 'plan'
+    user_message: Optional[str]        # 原始用户消息（用于闲聊/推荐回复）
 
     # ---- 用户请求解析结果 ----
     destination: Optional[str]          # 目的地（用户指定或推荐）

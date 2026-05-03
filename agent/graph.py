@@ -15,6 +15,7 @@ from .state import TravelPlanState
 from .nodes import (
     classify_intent,
     chat_reply,
+    recommend_destinations,
     parse_request,
     research_destinations,
     check_weather,
@@ -26,10 +27,12 @@ from .nodes import (
 
 
 def route_by_intent(state: dict) -> str:
-    """根据意图分类路由到闲聊或规划流程。"""
-    intent = state.get('intent', 'plan')
+    """根据意图分类路由到闲聊/推荐/规划流程。"""
+    intent = state.get('intent', 'recommend')
     if intent == 'chat':
         return 'chat_reply'
+    elif intent == 'recommend':
+        return 'recommend_destinations'
     return 'parse_request'
 
 
@@ -55,6 +58,7 @@ def _build_core_graph():
     # Nodes
     graph.add_node('classify_intent', classify_intent)
     graph.add_node('chat_reply', chat_reply)
+    graph.add_node('recommend_destinations', recommend_destinations)
     graph.add_node('parse_request', parse_request)
     graph.add_node('research_destinations', research_destinations)
     graph.add_node('check_weather', check_weather)
@@ -70,11 +74,18 @@ def _build_core_graph():
     graph.add_conditional_edges(
         'classify_intent',
         route_by_intent,
-        {'chat_reply': 'chat_reply', 'parse_request': 'parse_request'}
+        {
+            'chat_reply': 'chat_reply',
+            'recommend_destinations': 'recommend_destinations',
+            'parse_request': 'parse_request',
+        }
     )
 
     # Chat reply → END (short circuit)
     graph.add_edge('chat_reply', END)
+
+    # Recommend destinations → END (wait for user to pick)
+    graph.add_edge('recommend_destinations', END)
 
     # Planning flow
     graph.add_edge('parse_request', 'research_destinations')
