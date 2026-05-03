@@ -330,12 +330,22 @@ def research_destinations(state: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================================
 
 def check_weather(state: Dict[str, Any]) -> Dict[str, Any]:
-    """查询目的地天气（使用 wttr.in API）。"""
+    """查询目的地天气（彩云天气 API，wttr.in 备用）。"""
     destination = state.get('destination')
     if not destination:
         return {'weather': '暂无目的地信息'}
 
-    # Convert Chinese city names to pinyin/English for wttr.in
+    # 1. 优先使用彩云天气 API
+    try:
+        from .caiyun_weather import format_weather_summary
+        weather_info = format_weather_summary(destination)
+        if weather_info and len(weather_info.strip()) > 20:
+            print(f"[天气查询] 彩云天气 {destination} — 成功")
+            return {'weather': weather_info}
+    except Exception as e:
+        print(f"[彩云天气失败] {e}，切换到 wttr.in 备用")
+
+    # 2. 备用：wttr.in
     city_map = {
         '北京': 'Beijing', '上海': 'Shanghai', '广州': 'Guangzhou',
         '深圳': 'Shenzhen', '成都': 'Chengdu', '杭州': 'Hangzhou',
@@ -356,14 +366,13 @@ def check_weather(state: Dict[str, Any]) -> Dict[str, Any]:
         with urllib.request.urlopen(req, timeout=10) as resp:
             weather_text = resp.read().decode('utf-8')
 
-        # Also get 3-day forecast
         forecast_url = f"https://wttr.in/{city_en}?format=3&lang=zh"
         req2 = urllib.request.Request(forecast_url, headers={'User-Agent': 'TravelPlanner/1.0'})
         with urllib.request.urlopen(req2, timeout=10) as resp2:
             forecast = resp2.read().decode('utf-8')
 
-        weather_info = f"🌤️ {destination} 天气：\n当前：{weather_text}\n未来3天：\n{forecast}"
-        print(f"[天气查询] {weather_info[:80]}...")
+        weather_info = f"🌤️ {destination} 天气（wttr.in）：\n当前：{weather_text}\n未来3天：\n{forecast}"
+        print(f"[天气查询] wttr.in 备用 {destination}")
         return {'weather': weather_info}
     except Exception as e:
         print(f"[天气查询失败] {e}")
